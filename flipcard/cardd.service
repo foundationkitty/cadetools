@@ -1,0 +1,12 @@
+[Unit]
+Description=flipper zero card reader for aime and eamusement games
+After=graphical-session.target
+
+[Service]
+Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/%u/bin
+ExecStart=/etc/profiles/per-user/%u/bin/python3 %h/.local/share/flipcard/cardd.py run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
