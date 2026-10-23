@@ -1,7 +1,9 @@
+# General Setup 
 * put flipper-hinata on your flipper zero https://github.com/yamiYori/flipper-hinata/
 * add the following udev rules
 ```SUBSYSTEM=="hidraw", ATTRS{idVendor}=="f822", ATTRS{idProduct}=="0148", GROUP="users", MODE="0660"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="f822", ATTRS{idProduct}=="0148", ENV{ID_MM_DEVICE_IGNORE}="1"```
+SUBSYSTEM=="usb", ATTRS{idVendor}=="f822", ATTRS{idProduct}=="0148", ENV{ID_MM_DEVICE_IGNORE}="1"
+```
 * put `cardd.py in `~/.local/share/flipcard/`
 * put `cardd.service` in `~/.config/systemd/user/`
 * run `sudo systemctl daemon-reload`
@@ -19,4 +21,5 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="f822", ATTRS{idProduct}=="0148", ENV{ID_MM_D
 ```[aimeio]
 path=aimeio_tap_x64.dll
 tapPath=DEVICE\tap.txt
-tapHoldMs=3000```
+tapHoldMs=3000
+```
