@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""tasoller-mode: switch the USB mode of a TASOLLER Plus running Supernova firmware from the command line.
+
+Modes: winusb, 4k, 8k, 16k, 32k, io4
+
+  tasoller-mode get                 print the current mode
+  tasoller-mode set 16k             switch to a mode
+  tasoller-mode cycle               4k -> 8k -> 16k -> 32k -> io4 -> 4k ... (one step per run)
+  tasoller-mode cycle io4 16k       go to the next mode in your own list (wraps around)
+  tasoller-mode list                list connected devices / command channels
+
+Add --notify to any command to get a desktop notification (notify-send), handy from a sway keybinding.
+
+Protocol (from github.com/YttrisL/tasoller-plus-web-tools, docs/DEVELOPMENT.md, and the Supernova firmware's command.c):
+the command channel is HID interface 1 (64-byte reports, no report ID), AES-128-ECB encrypted frames
+[L][cmd][nonce][payload][..][sum8 at 63], session key = AES(shared key, 16-byte challenge) after a handshake (cmd 1).
+Mode: cmd 0x27 [0, 0xA5] reads (0xA5 makes Supernova report IO4-Emulation as 5), [1, mode] writes (saved to flash),
+then cmd 0x2F re-enumerates USB with the new mode.
+
+Pure standard library, Linux only (uses /dev/hidraw*). GPL-3.0, like the projects it is based on.
+"""
+import argparse
+import glob
+import os
+import select
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Device constants
+# ---------------------------------------------------------------------------------------------------------------------
+SHARED_KEY = bytes([0x07, 0x08, 0x0C, 0x43, 0x36, 0x57, 0x59, 0x36, 0x20, 0x0C, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00])
+FRAME = 64
+VID, IO4_VID, IO4_PID = 0x0E8F, 0x0CA3, 0x0021
+PID_MODE = {0x1231: 0, 0x1235: 1, 0x1234: 2, 0x1233: 3, 0x1232: 4}   # PID -> mode (stock firmware)
+PID_UPDATE = 0x1201
+CMD_HANDSHAKE, CMD_VERSION, CMD_ERROR, CMD_MODE, CMD_RESTART_USB = 0x01, 0x02, 0x05, 0x27, 0x2F
+MODE_QUERY_REAL = 0xA5
+CMD_INTERFACE = 1   # the command channel is USB interface 1 in every mode
+
+MODES = ["winusb", "4k", "8k", "16k", "32k", "io4"]
+DEFAULT_CYCLE = ["4k", "8k", "16k", "32k", "io4"]     # `tasoller-mode cycle` with no list
+MODE_LABELS = ["WINUSB", "4K keyboard", "8K keyboard", "16K keyboard", "32K keyboard", "IO4-Emulation"]
+MODE_ALIASES = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "win": 0, "winusb": 0, "4k": 1, "8k": 2, "16k": 3,
+                "32k": 4, "io4": 5, "io4-emulation": 5, "ioemu": 5}
+
+
+class TasollerError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# AES-128 (ECB, a handful of blocks per command, so pure Python is plenty fast)
+# ---------------------------------------------------------------------------------------------------------------------
+def _xtime(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+def _mul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a = _xtime(a)
+        b >>= 1
+    return r
+
+
+def _build_sbox():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)) & 0xFF
+        q ^= (q << 1) & 0xFF
+        q ^= (q << 2) & 0xFF
+        q ^= (q << 4) & 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        rot = lambda x, n: ((x << n) | (x >> (8 - n))) & 0xFF
+        sbox[p] = (q ^ rot(q, 1) ^ rot(q, 2) ^ rot(q, 3) ^ rot(q, 4) ^ 0x63) & 0xFF
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    inv = [0] * 256
+    for i, v in enumerate(sbox):
+        inv[v] = i
+    return sbox, inv
+
+
+SBOX, INV_SBOX = _build_sbox()
+M2, M3, M9, M11, M13, M14 = ([_mul(i, k) for i in range(256)] for k in (2, 3, 9, 11, 13, 14))
+
+
+def aes_expand_key(key):
+    w = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    rcon = 1
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = [SBOX[b] for b in (t[1], t[2], t[3], t[0])]
+            t[0] ^= rcon
+            rcon = _xtime(rcon)
+        w.append([a ^ b for a, b in zip(w[i - 4], t)])
+    return bytes(b for word in w for b in word)
+
+
+def _enc_block(rk, blk):
+    s = [blk[i] ^ rk[i] for i in range(16)]
+    for rnd in range(1, 11):
+        t = [SBOX[s[(i + 4 * (i & 3)) & 15]] for i in range(16)]       # SubBytes + ShiftRows
+        if rnd != 10:
+            s = [0] * 16
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = t[c:c + 4]
+                s[c] = M2[a0] ^ M3[a1] ^ a2 ^ a3
+                s[c + 1] = a0 ^ M2[a1] ^ M3[a2] ^ a3
+                s[c + 2] = a0 ^ a1 ^ M2[a2] ^ M3[a3]
+                s[c + 3] = M3[a0] ^ a1 ^ a2 ^ M2[a3]
+        else:
+            s = t
+        s = [s[i] ^ rk[rnd * 16 + i] for i in range(16)]
+    return bytes(s)
+
+
+def _dec_block(rk, blk):
+    s = [blk[i] ^ rk[160 + i] for i in range(16)]
+    for rnd in range(9, -1, -1):
+        t = [0] * 16
+        for i in range(16):
+            t[(i + 4 * (i & 3)) & 15] = INV_SBOX[s[i]]                  # InvShiftRows + InvSubBytes
+        s = [t[i] ^ rk[rnd * 16 + i] for i in range(16)]
+        if rnd != 0:
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = s[c:c + 4]
+                s[c] = M14[a0] ^ M11[a1] ^ M13[a2] ^ M9[a3]
+                s[c + 1] = M9[a0] ^ M14[a1] ^ M11[a2] ^ M13[a3]
+                s[c + 2] = M13[a0] ^ M9[a1] ^ M14[a2] ^ M11[a3]
+                s[c + 3] = M11[a0] ^ M13[a1] ^ M9[a2] ^ M14[a3]
+    return bytes(s)
+
+
+def aes_ecb(rk, data, encrypt):
+    f = _enc_block if encrypt else _dec_block
+    return b"".join(f(rk, data[o:o + 16]) for o in range(0, len(data), 16))
+
+
+SHARED_RK = aes_expand_key(SHARED_KEY)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Frames and the command channel
+# ---------------------------------------------------------------------------------------------------------------------
+def build_frame(cmd, nonce, payload):
+    payload = bytes(payload)
+    if len(payload) > 60:
+        raise ValueError("payload too long")
+    f = bytearray(FRAME)
+    f[0] = 2 + len(payload)
+    f[1] = cmd
+    f[2] = nonce
+    f[3:3 + len(payload)] = payload
+    f[FRAME - 1] = sum(f[1:1 + f[0]]) & 0xFF
+    return bytes(f)
+
+
+class HidrawIO:
+    """64-byte reports on a /dev/hidrawN node; the device uses no report IDs, so writes get a leading 0."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except PermissionError:
+            raise TasollerError(f"no permission to open {path} (install the udev rule, see the README)")
+
+    def flush(self):
+        while True:
+            try:
+                if not os.read(self.fd, 256):
+                    return
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+
+    def send(self, frame):
+        os.write(self.fd, b"\x00" + frame)
+
+    def recv(self, timeout):
+        end = time.monotonic() + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                return None
+            try:
+                d = os.read(self.fd, 256)
+            except BlockingIOError:
+                continue
+            if len(d) >= FRAME:
+                return d[:FRAME]
+            if d:
+                return d.ljust(FRAME, b"\x00")
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+class Link:
+    def __init__(self, io):
+        self.io = io
+        self.rk = SHARED_RK
+
+    def handshake(self, attempts=3, timeout=1.5):
+        last = "no answer"
+        for _ in range(attempts):
+            challenge, nonce = os.urandom(16), os.urandom(1)[0]
+            request = build_frame(CMD_HANDSHAKE, nonce, challenge)          # sent in the clear
+            self.rk = aes_expand_key(aes_ecb(SHARED_RK, challenge, True))
+            self.io.flush()
+            self.io.send(request)
+            raw = self.io.recv(timeout)
+            if raw is None:
+                continue
+            r = aes_ecb(self.rk, raw, False)
+            if r[1] == CMD_HANDSHAKE and r[2] == nonce:
+                return
+            last = "invalid handshake reply (not the Tasoller command channel?)"
+        self.rk = SHARED_RK
+        raise TasollerError("handshake failed: " + last)
+
+    def command(self, cmd, payload=b"", timeout=2.0, what=None):
+        what = what or f"command 0x{cmd:02x}"
+        nonce = os.urandom(1)[0]
+        self.io.flush()
+        self.io.send(aes_ecb(self.rk, build_frame(cmd, nonce, payload), True))
+        for _ in range(6):
+            raw = self.io.recv(timeout)
+            if raw is None:
+                raise TasollerError(what + ": no answer from the device")
+            r = aes_ecb(self.rk, raw, False)
+            if r[1] == cmd:
+                return r[3:1 + min(r[0], 62)]
+            if r[1] == CMD_ERROR:
+                raise TasollerError(f"{what}: the device reported an error (status {r[3]})")
+        raise TasollerError(what + ": unexpected replies")
+
+    def version(self):
+        p = self.command(CMD_VERSION, b"", 1.5, "reading the version")
+        return p.split(b"\x00", 1)[0].decode("ascii", "replace")
+
+    def get_mode(self):
+        p = self.command(CMD_MODE, [0, MODE_QUERY_REAL], 2.0, "read mode")
+        if len(p) < 2:
+            raise TasollerError("read mode: short reply")
+        return p[1]
+
+    def set_mode(self, m):
+        self.command(CMD_MODE, [1, m], 5.0, "set mode")
+
+    def restart_usb(self):
+        try:
+            self.command(CMD_RESTART_USB, b"", 1.0, "restart USB")
+        except (TasollerError, OSError):
+            pass    # normal: the device may drop off the bus before it answers
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Finding the device
+# ---------------------------------------------------------------------------------------------------------------------
+def _hidraw_nodes():
+    """Yield (devpath, vid, pid, interface, name) for every hidraw node of a Tasoller (any mode)."""
+    for sys_node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        dev = os.path.join(sys_node, "device")
+        try:
+            with open(os.path.join(dev, "uevent")) as fh:
+                ue = dict(line.rstrip("\n").split("=", 1) for line in fh if "=" in line)
+        except OSError:
+            continue
+        try:
+            _bus, vid, pid = (int(x, 16) for x in ue.get("HID_ID", "").split(":"))
+        except ValueError:
+            continue
+        if not ((vid == VID and (pid in PID_MODE or pid == PID_UPDATE)) or (vid == IO4_VID and pid == IO4_PID)):
+            continue
+        iface = None
+        try:
+            with open(os.path.join(dev, "..", "bInterfaceNumber")) as fh:
+                iface = int(fh.read().strip(), 16)
+        except (OSError, ValueError):
+            pass
+        yield "/dev/" + os.path.basename(sys_node), vid, pid, iface, ue.get("HID_NAME", "")
+
+
+def _is_vendor_channel(devpath):
+    """The command channel and the live data use a vendor report descriptor (usage page 0xFF00)."""
+    try:
+        with open(f"/sys/class/hidraw/{os.path.basename(devpath)}/device/report_descriptor", "rb") as fh:
+            return fh.read(3) == b"\x06\x00\xff"
+    except OSError:
+        return True
+
+
+def open_device(wait=0.0):
+    """Find the command channel and return (link, pid_info). Retries up to `wait` seconds."""
+    end = time.monotonic() + wait
+    while True:
+        nodes = [n for n in _hidraw_nodes() if _is_vendor_channel(n[0])]
+        # interface 1 first: it is the command channel in every mode; the others are tried after it
+        nodes.sort(key=lambda n: (n[3] != CMD_INTERFACE, n[0]))
+        errors = []
+        for path, vid, pid, iface, name in nodes:
+            if vid == VID and pid == PID_UPDATE:
+                raise TasollerError("the device is in firmware update mode (unplug and plug it in again)")
+            io = None
+            try:
+                io = HidrawIO(path)
+                link = Link(io)
+                link.handshake(attempts=2 if iface == CMD_INTERFACE else 1, timeout=1.0)
+                return link, (vid, pid, path, name)
+            except TasollerError as e:
+                errors.append(f"{path}: {e}")
+                if io:
+                    io.close()
+                if "permission" in str(e):
+                    raise
+            except OSError as e:
+                errors.append(f"{path}: {e}")
+                if io:
+                    io.close()
+        if time.monotonic() >= end:
+            if not nodes:
+                raise TasollerError("no Tasoller found (is it plugged in?)")
+            raise TasollerError("no command channel answered: " + "; ".join(errors))
+        time.sleep(0.5)
+
+
+def parse_mode(s):
+    m = MODE_ALIASES.get(s.strip().lower())
+    if m is None:
+        raise TasollerError(f"unknown mode '{s}' (use one of: {', '.join(MODES)})")
+    return m
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------------------------------------------------
+def notify(enabled, title, body, urgency="normal"):
+    if not enabled:
+        return
+    try:
+        subprocess.Popen(["notify-send", "-a", "tasoller-mode", "-u", urgency, "-h", "string:x-canonical-private-synchronous:tasoller-mode",
+                          title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def switch_to(link, target, current, args):
+    if current == target:
+        msg = f"already in {MODE_LABELS[target]} mode"
+        print(msg)
+        notify(args.notify, "Tasoller", msg)
+        return
+    link.set_mode(target)
+    back = link.get_mode()
+    if back != target:
+        raise TasollerError(f"the device reports mode {back} after the switch")
+    link.restart_usb()
+    msg = f"{MODE_LABELS[current]} → {MODE_LABELS[target]}"
+    print(msg)
+    notify(args.notify, "Tasoller mode", msg)
+    if args.wait_back:
+        time.sleep(1.5)
+        link2, _ = open_device(wait=args.wait_back)
+        try:
+            now = link2.get_mode()
+        finally:
+            link2.io.close()
+        print(f"device is back in {MODE_LABELS[now]} mode")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="tasoller-mode", description="Switch the USB mode of a TASOLLER Plus (Supernova firmware).")
+    ap.add_argument("--notify", action="store_true", help="show a desktop notification (notify-send)")
+    ap.add_argument("--wait-back", type=float, default=0, metavar="SEC",
+                    help="after switching, wait up to SEC seconds for the device to come back and confirm the mode")
+    ap.add_argument("--timeout", type=float, default=3.0, metavar="SEC",
+                    help="how long to wait for the device to appear (default 3)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("get", help="print the current mode")
+    p_set = sub.add_parser("set", help="switch to a mode")
+    p_set.add_argument("mode", help=" | ".join(MODES))
+    p_cyc = sub.add_parser("cycle", help="switch to the mode after the current one in the given list")
+    p_cyc.add_argument("modes", nargs="*", default=DEFAULT_CYCLE,
+                       help="e.g. io4 16k (default: " + " ".join(DEFAULT_CYCLE) + ")")
+    p_cyc.add_argument("--reverse", action="store_true", help="go backwards through the list")
+    sub.add_parser("list", help="list the Tasoller HID nodes")
+    args = ap.parse_args(argv)
+
+    try:
+        if args.cmd == "list":
+            found = False
+            for path, vid, pid, iface, name in _hidraw_nodes():
+                found = True
+                print(f"{path}  {vid:04x}:{pid:04x}  interface {iface}  {name}"
+                      f"{'  (vendor channel)' if _is_vendor_channel(path) else ''}")
+            if not found:
+                print("no Tasoller found")
+                return 1
+            return 0
+
+        link, (vid, pid, path, name) = open_device(wait=args.timeout)
+        try:
+            current = link.get_mode()
+            if current >= len(MODES):
+                raise TasollerError(f"the device reports an unknown mode {current}")
+            if args.cmd == "get":
+                print(MODES[current])
+                notify(args.notify, "Tasoller mode", MODE_LABELS[current])
+                return 0
+            if args.cmd == "set":
+                target = parse_mode(args.mode)
+            else:
+                ring = [parse_mode(m) for m in args.modes]
+                if args.reverse:
+                    ring.reverse()
+                target = ring[(ring.index(current) + 1) % len(ring)] if current in ring else ring[0]
+            if target == 5:
+                ver = link.version()
+                if "_CFW_SNV_" not in ver:
+                    raise TasollerError(f"IO4-Emulation needs the Supernova firmware (device runs {ver})")
+            switch_to(link, target, current, args)
+        finally:
+            link.io.close()
+        return 0
+    except TasollerError as e:
+        print("tasoller-mode: " + str(e), file=sys.stderr)
+        notify(args.notify, "Tasoller mode switch failed", str(e), "critical")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

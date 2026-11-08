@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_ID="sonolus-link-grabber"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+MIMEAPPS="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+DESKTOP="$APPS_DIR/$APP_ID.desktop"
+MIME="x-scheme-handler/sonolus"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/$APP_ID.log"
+NOW_PLAYING="${XDG_RUNTIME_DIR:-/tmp}/sonolus-now"
+BOOT_TIMEOUT="${SONOLUS_BOOT_TIMEOUT:-90}"
+CONTROLLER="${SONOLUS_CONTROLLER:-$HOME/Documents/cadetools/sonolus/sonolus.py}"
+PYTHON="${SONOLUS_PYTHON:-python3}"
+CONTROLLER_PATTERN='^([^ ]*/)?python3?(\.[0-9]+)?( -[^ ]+)* ([^ ]*/)?sonolus\.py( |$)'
+
+log()    { printf '%s %s\n' "$(date +%T)" "$*" >>"$LOG"; }
+notify() { command -v notify-send >/dev/null && notify-send -a Sonolus -i waydroid "Sonolus" "$*" || true; log "$*"; }
+die()    { notify "$*"; echo "$APP_ID: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Open Sonolus links from the host in Waydroid.
+
+usage:
+  $APP_ID --install      register as the sonolus:// handler for this user
+  $APP_ID --uninstall    remove it again
+  $APP_ID --clip         open the Sonolus link currently on the clipboard
+  $APP_ID URL            open a link:
+      sonolus://host/path
+      https://open.sonolus.com/host/path
+      https://host/path
+
+Starts Waydroid if it isn't running, and the controller bridge
+($CONTROLLER) if it isn't already up.
+EOF
+}
+
+set_default() {
+  local mime=$1 id=$2 tmp
+  mkdir -p "$(dirname "$MIMEAPPS")"
+  touch "$MIMEAPPS"
+  tmp=$(mktemp)
+  awk -v mime="$mime" -v id="$id" '
+    function flush() {
+      if (sect == "[Default Applications]" && !done_def) { print mime "=" id; done_def = 1 }
+      if (sect == "[Added Associations]"   && !done_add) { print mime "=" id ";"; done_add = 1 }
+    }
+    /^\[/ { flush(); sect = $0; print; next }
+    index($0, mime "=") == 1 { next }
+    { print }
+    END {
+      flush()
+      if (!done_def) { print ""; print "[Default Applications]"; print mime "=" id }
+      if (!done_add) { print ""; print "[Added Associations]"; print mime "=" id ";" }
+    }' "$MIMEAPPS" >"$tmp"
+  mv "$tmp" "$MIMEAPPS"
+}
+
+unset_default() {
+  local mime=$1 tmp
+  [[ -f $MIMEAPPS ]] || return 0
+  tmp=$(mktemp)
+  grep -v "^${mime}=" "$MIMEAPPS" >"$tmp" || true
+  mv "$tmp" "$MIMEAPPS"
+}
+
+install_self() {
+  local self target="$BIN_DIR/$APP_ID"
+  mkdir -p "$BIN_DIR" "$APPS_DIR"
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  if [[ $self != "$(readlink -f "$target" 2>/dev/null || true)" ]]; then
+    install -m 755 "$self" "$target"
+  fi
+
+  cat >"$DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Sonolus (Waydroid)
+Comment=Open Sonolus links in Waydroid
+Exec=$target %u
+Icon=waydroid
+Terminal=false
+NoDisplay=true
+MimeType=$MIME;
+EOF
+  set_default "$MIME" "$APP_ID.desktop"
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" 2>/dev/null || true
+
+  echo "Installed:"
+  echo "  $target"
+  echo "  $DESKTOP"
+  echo "  $MIMEAPPS  ($MIME=$APP_ID.desktop)"
+  if command -v xdg-mime >/dev/null; then
+    echo "xdg-mime says: $(xdg-mime query default "$MIME" 2>/dev/null || echo '?')"
+  fi
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo "(note: $BIN_DIR is not on PATH; the handler still works, --clip needs the full path)"
+  fi
+  echo "Restart your browser so it picks up the new handler."
+}
+
+uninstall_self() {
+  unset_default "$MIME"
+  rm -f "$DESKTOP" "$BIN_DIR/$APP_ID"
+  echo "Removed $APP_ID handler."
+}
+
+to_deeplink() {
+  local u=$1
+  u="${u#"${u%%[![:space:]]*}"}"
+  u="${u%"${u##*[![:space:]]}"}"
+  case "$u" in
+    sonolus://*)
+      printf '%s' "$u" ;;
+    https://open.sonolus.com/*|http://open.sonolus.com/*)
+      printf 'sonolus://%s' "${u#*://open.sonolus.com/}" ;;
+    https://*|http://*)
+      printf 'sonolus://%s' "${u#*://}" ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+android_ready() { waydroid app list 2>/dev/null | grep -q packageName; }
+
+start_controller() {
+  local running
+  if running=$(pgrep -af "$CONTROLLER_PATTERN"); then
+    log "controller already running: $running"
+    return 0
+  fi
+  if [[ ! -f $CONTROLLER ]]; then
+    notify "controller script not found: $CONTROLLER"
+    return 0
+  fi
+  if ! command -v "$PYTHON" >/dev/null; then
+    notify "can't start the controller: $PYTHON not found"
+    return 0
+  fi
+
+  log "starting controller: $PYTHON $CONTROLLER"
+  setsid -f "$PYTHON" "$CONTROLLER" >>"$LOG" 2>&1
+  sleep 2
+  if ! pgrep -f "$CONTROLLER_PATTERN" >/dev/null; then
+    notify "controller exited: $(grep -v '^[0-9:]* ' "$LOG" | tail -n 1)"
+  fi
+}
+
+ensure_waydroid() {
+  command -v waydroid >/dev/null || die "waydroid not found on PATH"
+
+  start_controller
+  setsid -f waydroid show-full-ui >/dev/null 2>&1
+
+  android_ready && return 0
+  notify "Starting Waydroid…"
+  for ((i = 0; i < BOOT_TIMEOUT; i++)); do
+    sleep 1
+    if android_ready; then
+      sleep 1
+      return 0
+    fi
+  done
+  die "Waydroid didn't finish booting within ${BOOT_TIMEOUT}s"
+}
+
+open_link() {
+  local link
+  link=$(to_deeplink "$1") || die "not a Sonolus link: $1"
+  log "open $1 -> $link"
+  printf '%s\n' "$link" >"$NOW_PLAYING"
+  ensure_waydroid
+  waydroid app intent android.intent.action.VIEW "$link" >>"$LOG" 2>&1 \
+    || die "waydroid refused the intent (see $LOG)"
+}
+
+clip() {
+  local c
+  if command -v wl-paste >/dev/null; then
+    c=$(wl-paste --no-newline 2>/dev/null || true)
+  elif command -v xclip >/dev/null; then
+    c=$(xclip -o -selection clipboard 2>/dev/null || true)
+  else
+    die "need wl-paste (wl-clipboard) or xclip for --clip"
+  fi
+  [[ -n $c ]] || die "clipboard is empty"
+  open_link "$c"
+}
+
+case "${1:-}" in
+  --install)    install_self ;;
+  --uninstall)  uninstall_self ;;
+  --clip)       clip ;;
+  -h|--help|"") usage ;;
+  *)            open_link "$1" ;;
+esac
